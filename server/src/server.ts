@@ -11,6 +11,8 @@ import {
   InitializeResult,
   ProposedFeatures,
   TextDocumentSyncKind,
+  Position,
+  Range,
 } from "vscode-languageserver/node";
 import { TextDocument } from "vscode-languageserver-textdocument";
 
@@ -338,6 +340,9 @@ function parseUmpleJsonDiagnostics(
       console.log(result);
       const lineNumber = Math.max(Number(result.line ?? "1") - 1, 0);
       const lineText = lines[lineNumber] ?? "";
+      console.log(lineText);
+      const firstNonSpace = lineText.search(/\S/);
+      const startChar = firstNonSpace === -1 ? 0 : firstNonSpace;
       const severityValue = Number(result.severity ?? "3");
       const severity =
         severityValue > 2
@@ -354,10 +359,10 @@ function parseUmpleJsonDiagnostics(
 
       return {
         severity,
-        range: {
-          start: { line: lineNumber, character: 0 },
-          end: { line: lineNumber, character: lineText.length },
-        },
+        range: Range.create(
+          Position.create(lineNumber, startChar),
+          Position.create(lineNumber, lineText.length),
+        ),
         message: details.join(": "),
         source: "umple",
       };
