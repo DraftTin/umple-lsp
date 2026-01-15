@@ -1,8 +1,8 @@
-import { execFile, ExecFileException } from "child_process";
+import { ChildProcess, spawn } from "child_process";
 import * as fs from "fs";
+import * as net from "net";
 import * as os from "os";
 import * as path from "path";
-import { promisify } from "util";
 import {
   createConnection,
   Diagnostic,
@@ -14,19 +14,35 @@ import {
 } from "vscode-languageserver/node";
 import { TextDocument } from "vscode-languageserver-textdocument";
 
-const execFileAsync = promisify(execFile);
 const connection = createConnection(ProposedFeatures.all);
 const documents = new Map<string, TextDocument>();
 const pendingValidations = new Map<string, NodeJS.Timeout>();
 
-let umpleJarPath: string | undefined;
+let umpleSyncJarPath: string | undefined;
+let umpleSyncHost = "localhost";
+let umpleSyncPort = 5555;
 let jarWarningShown = false;
+let serverProcess: ChildProcess | undefined;
 
 connection.onInitialize((params: InitializeParams): InitializeResult => {
   const initOptions = params.initializationOptions as
-    | { umpleJarPath?: string }
+    | {
+        umpleSyncJarPath?: string;
+        umpleSyncHost?: string;
+        umpleSyncPort?: number;
+      }
     | undefined;
-  umpleJarPath = initOptions?.umpleJarPath || process.env.UMPLE_JAR;
+  umpleSyncJarPath = initOptions?.umpleSyncJarPath;
+  umpleSyncHost =
+    initOptions?.umpleSyncHost || process.env.UMPLESYNC_HOST || "localhost";
+  if (typeof initOptions?.umpleSyncPort === "number") {
+    umpleSyncPort = initOptions.umpleSyncPort;
+  } else if (process.env.UMPLESYNC_PORT) {
+    const parsed = Number(process.env.UMPLESYNC_PORT);
+    if (!Number.isNaN(parsed)) {
+      umpleSyncPort = parsed;
+    }
+  }
 
   return {
     capabilities: {
@@ -39,6 +55,7 @@ connection.onInitialized(() => {
   connection.console.info("Umple language server initialized.");
 });
 
+// Create
 connection.onDidOpenTextDocument((params) => {
   const document = TextDocument.create(
     params.textDocument.uri,
@@ -55,8 +72,11 @@ connection.onDidChangeTextDocument((params) => {
   if (!document) {
     return;
   }
-  const updated = TextDocument.update(document, params.contentChanges, params.textDocument.version);
-  console.log("Document updated:", params.textDocument.uri);
+  const updated = TextDocument.update(
+    document,
+    params.contentChanges,
+    params.textDocument.version,
+  );
   documents.set(params.textDocument.uri, updated);
   scheduleValidation(updated);
 });
@@ -84,118 +104,269 @@ async function validateTextDocument(document: TextDocument): Promise<void> {
     return;
   }
 
-  const diagnostics = await runUmpleAndParseDiagnostics(jarPath, document.getText());
+  const diagnostics = await runUmpleSyncAndParseDiagnostics(
+    jarPath,
+    document.getText(),
+  );
   connection.sendDiagnostics({ uri: document.uri, diagnostics });
 }
 
 function resolveJarPath(): string | undefined {
-  if (!umpleJarPath) {
+  if (!umpleSyncJarPath) {
     if (!jarWarningShown) {
       connection.window.showWarningMessage(
-        "Umple jar path not set. Configure initializationOptions.umpleJarPath or UMPLE_JAR.",
+        "UmpleSync jar path not set. Configure initializationOptions.umpleSyncJarPath or UMPLESYNC_JAR.",
       );
       jarWarningShown = true;
     }
     return undefined;
   }
 
-  if (!fs.existsSync(umpleJarPath)) {
+  if (!fs.existsSync(umpleSyncJarPath)) {
     if (!jarWarningShown) {
       connection.window.showWarningMessage(
-        `Umple jar not found at ${umpleJarPath}. Update the path or UMPLE_JAR.`,
+        `UmpleSync jar not found at ${umpleSyncJarPath}. Update the path or UMPLESYNC_JAR.`,
       );
       jarWarningShown = true;
     }
     return undefined;
   }
 
-  return umpleJarPath;
+  return umpleSyncJarPath;
 }
 
-async function runUmpleAndParseDiagnostics(
+async function runUmpleSyncAndParseDiagnostics(
   jarPath: string,
   content: string,
 ): Promise<Diagnostic[]> {
-  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "umple-lsp-"));
+  const tempDir = await fs.promises.mkdtemp(
+    path.join(os.tmpdir(), "umple-lsp-"),
+  );
   const tempFile = path.join(tempDir, "document.ump");
   await fs.promises.writeFile(tempFile, content, "utf8");
 
-  let stdout = "";
-  let stderr = "";
-
   try {
-    const result = await execFileAsync("java", ["-jar", jarPath, "-c-", tempFile], {
-      encoding: "utf8",
-      maxBuffer: 1024 * 1024,
-    });
-    stdout = result.stdout ?? "";
-    stderr = result.stderr ?? "";
-  } catch (error) {
-    const execError = error as ExecFileException & { stdout?: string; stderr?: string };
-    stdout = execError.stdout ?? "";
-    stderr = execError.stderr ?? "";
+    const commandLine = `-generate nothing ${tempFile}`;
+    const { stdout, stderr } = await sendUmpleSyncCommand(jarPath, commandLine);
+    return parseUmpleDiagnostics(stderr, stdout);
   } finally {
     await fs.promises.rm(tempDir, { recursive: true, force: true });
   }
+}
 
-  return parseUmpleDiagnostics(stderr, stdout);
+async function sendUmpleSyncCommand(
+  jarPath: string,
+  commandLine: string,
+): Promise<{ stdout: string; stderr: string }> {
+  try {
+    return await connectAndSend(commandLine);
+  } catch (error) {
+    if (!isConnectionError(error)) {
+      throw error;
+    }
+
+    const started = await startUmpleSyncServer(jarPath);
+    if (!started) {
+      throw error;
+    }
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        return await connectAndSend(commandLine);
+      } catch (retryError) {
+        if (!isConnectionError(retryError)) {
+          throw retryError;
+        }
+        await delay(150);
+      }
+    }
+
+    throw error;
+  }
+}
+
+// Send command to UmpleSync.jar socket server and receive the output
+function connectAndSend(
+  commandLine: string,
+): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const socket = new net.Socket();
+    const chunks: string[] = [];
+
+    socket.setEncoding("utf8");
+    socket.setTimeout(2000);
+
+    socket.on("data", (chunk) => {
+      if (typeof chunk === "string") {
+        chunks.push(chunk);
+      } else {
+        chunks.push(chunk.toString("utf8"));
+      }
+    });
+
+    socket.on("end", () => {
+      const raw = chunks.join("");
+      const { stdout, stderr } = splitUmpleSyncOutput(raw);
+      resolve({ stdout, stderr });
+    });
+
+    socket.on("error", (err) => {
+      socket.destroy();
+      reject(err);
+    });
+
+    socket.on("timeout", () => {
+      socket.destroy(new Error("umplesync socket timeout"));
+    });
+
+    socket.connect(umpleSyncPort, umpleSyncHost, () => {
+      socket.end(commandLine);
+    });
+  });
+}
+
+async function startUmpleSyncServer(jarPath: string): Promise<boolean> {
+  if (serverProcess) {
+    return true;
+  }
+
+  return new Promise((resolve) => {
+    const child = spawn(
+      "java",
+      ["-jar", jarPath, "-server", String(umpleSyncPort)],
+      {
+        detached: true,
+        stdio: "ignore",
+      },
+    );
+
+    child.on("error", (err) => {
+      connection.console.error(`Failed to start umplesync: ${String(err)}`);
+      resolve(false);
+    });
+
+    child.unref();
+    serverProcess = child;
+    resolve(true);
+  });
+}
+
+function splitUmpleSyncOutput(raw: string): { stdout: string; stderr: string } {
+  let stdout = "";
+  let stderr = "";
+  let index = 0;
+
+  while (index < raw.length) {
+    const start = raw.indexOf("ERROR!!", index);
+    if (start === -1) {
+      stdout += raw.slice(index);
+      break;
+    }
+
+    stdout += raw.slice(index, start);
+    const end = raw.indexOf("!!ERROR", start + 7);
+    if (end === -1) {
+      stderr += raw.slice(start + 7);
+      break;
+    }
+
+    stderr += raw.slice(start + 7, end);
+    index = end + 7;
+  }
+
+  return { stdout, stderr };
+}
+
+function isConnectionError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  const maybeError = error as { code?: string };
+  return (
+    maybeError.code === "ECONNREFUSED" ||
+    maybeError.code === "ECONNRESET" ||
+    maybeError.code === "EPIPE"
+  );
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function parseUmpleDiagnostics(stderr: string, stdout: string): Diagnostic[] {
-  const diagnostics: Diagnostic[] = [];
-  const lines = stderr.split(/\r?\n/);
+  const jsonDiagnostics = parseUmpleJsonDiagnostics(stderr);
+  if (jsonDiagnostics.length === 0 && stdout.includes("Success")) {
+    connection.console.info("Umple compile succeeded.");
+  }
 
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i].trim();
-    if (!line) {
-      continue;
+  return jsonDiagnostics;
+}
+
+type UmpleJsonResult = {
+  errorCode?: string;
+  severity?: string;
+  url?: string;
+  line?: string;
+  filename?: string;
+  message?: string;
+};
+
+function parseUmpleJsonDiagnostics(stderr: string): Diagnostic[] {
+  const trimmed = stderr.trim();
+  if (!trimmed) {
+    return [];
+  }
+
+  const jsonText = extractJson(trimmed);
+  if (!jsonText) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(jsonText) as { results?: UmpleJsonResult[] };
+    if (!Array.isArray(parsed.results)) {
+      return [];
     }
 
-    const javaMatch = line.match(/^(.*\.ump):(\d+):\s*(warning|error):\s*(.*)$/i);
-    if (javaMatch) {
-      const lineNumber = Math.max(Number(javaMatch[2]) - 1, 0);
-      diagnostics.push({
-        severity: javaMatch[3].toLowerCase() === "warning"
+    return parsed.results.map((result) => {
+      console.log(result);
+      const lineNumber = Math.max(Number(result.line ?? "1") - 1, 0);
+      const severityValue = Number(result.severity ?? "3");
+      const severity =
+        severityValue > 2
           ? DiagnosticSeverity.Warning
-          : DiagnosticSeverity.Error,
+          : DiagnosticSeverity.Error;
+
+      const details = [
+        result.errorCode
+          ? (severity == DiagnosticSeverity.Warning ? "W" : "E") +
+            result.errorCode
+          : undefined,
+        result.message,
+      ].filter(Boolean);
+
+      return {
+        severity,
         range: {
           start: { line: lineNumber, character: 0 },
           end: { line: lineNumber, character: 1 },
         },
-        message: javaMatch[4].trim(),
+        message: details.join(": "),
         source: "umple",
-      });
-      continue;
-    }
-
-    if (line.startsWith("Error") || line.startsWith("Warning")) {
-      const isWarning = line.startsWith("Warning");
-      const meta = line.split(" ");
-      const lineIndex = meta.indexOf("line");
-      const lineNumber = lineIndex >= 0 ? Number(meta[lineIndex + 1]) : 1;
-      const message = (lines[i + 1] ?? line).trim();
-
-      diagnostics.push({
-        severity: isWarning ? DiagnosticSeverity.Warning : DiagnosticSeverity.Error,
-        range: {
-          start: { line: Math.max(lineNumber - 1, 0), character: 0 },
-          end: { line: Math.max(lineNumber - 1, 0), character: 1 },
-        },
-        message,
-        source: "umple",
-      });
-
-      if (lines[i + 1]) {
-        i += 1;
-      }
-    }
+      };
+    });
+  } catch {
+    return [];
   }
+}
 
-  if (diagnostics.length === 0 && stdout.includes("Success")) {
-    connection.console.info("Umple compile succeeded.");
+function extractJson(text: string): string | null {
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) {
+    return null;
   }
-
-  return diagnostics;
+  return text.slice(start, end + 1);
 }
 
 connection.listen();
