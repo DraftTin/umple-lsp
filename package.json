@@ -3,39 +3,44 @@
   "displayName": "umple-language-server",
   "description": "Language server for the Umple modeling language",
   "version": "0.0.1",
+  "private": true,
   "engines": {
     "vscode": "^1.108.0"
   },
-  "main": "./out/extension.js",
+  "main": "./client/out/extension",
   "categories": [
     "Programming Languages"
   ],
+  "workspaces": [
+    "client",
+    "server"
+  ],
   "scripts": {
-    "compile": "tsc -p ./ && tsc -p ./server",
-    "watch": "tsc -watch -p ./",
-    "vscode:prepublish": "npm run compile"
-  },
-  "dependencies": {
-    "vscode-languageclient": "^9.0.1",
-    "vscode-languageserver": "^9.0.1",
-    "vscode-languageserver-textdocument": "^1.0.11"
-  },
-  "devDependencies": {
-    "@types/node": "^22.10.2",
-    "@types/vscode": "^1.108.1",
-    "typescript": "^5.7.2"
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -b",
+    "watch": "tsc -b -w",
+    "postinstall": "cd client && npm install && cd ../server && npm install && cd .."
   },
   "contributes": {
-    "languages": [{
-      "id": "umple",
-      "aliases": ["Umple", "umple"],
-      "extensions": [".ump"],
-      "configuration": "./language-configuration.json"
-    }],
-    "grammars": [{
-      "language": "umple",
-      "scopeName": "source.umple",
-      "path": "./syntaxes/umple.tmLanguage"
-    }]
+    "languages": [
+      {
+        "id": "umple",
+        "aliases": [
+          "Umple",
+          "umple"
+        ],
+        "extensions": [
+          ".ump"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "umple",
+        "scopeName": "source.umple",
+        "path": "./syntaxes/umple.tmLanguage"
+      }
+    ]
   }
 }
