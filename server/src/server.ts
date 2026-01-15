@@ -104,10 +104,7 @@ async function validateTextDocument(document: TextDocument): Promise<void> {
     return;
   }
 
-  const diagnostics = await runUmpleSyncAndParseDiagnostics(
-    jarPath,
-    document.getText(),
-  );
+  const diagnostics = await runUmpleSyncAndParseDiagnostics(jarPath, document);
   connection.sendDiagnostics({ uri: document.uri, diagnostics });
 }
 
@@ -137,18 +134,18 @@ function resolveJarPath(): string | undefined {
 
 async function runUmpleSyncAndParseDiagnostics(
   jarPath: string,
-  content: string,
+  document: TextDocument,
 ): Promise<Diagnostic[]> {
   const tempDir = await fs.promises.mkdtemp(
     path.join(os.tmpdir(), "umple-lsp-"),
   );
   const tempFile = path.join(tempDir, "document.ump");
-  await fs.promises.writeFile(tempFile, content, "utf8");
+  await fs.promises.writeFile(tempFile, document.getText(), "utf8");
 
   try {
     const commandLine = `-generate nothing ${tempFile}`;
     const { stdout, stderr } = await sendUmpleSyncCommand(jarPath, commandLine);
-    return parseUmpleDiagnostics(stderr, stdout);
+    return parseUmpleDiagnostics(stderr, stdout, document);
   } finally {
     await fs.promises.rm(tempDir, { recursive: true, force: true });
   }
@@ -293,8 +290,12 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function parseUmpleDiagnostics(stderr: string, stdout: string): Diagnostic[] {
-  const jsonDiagnostics = parseUmpleJsonDiagnostics(stderr);
+function parseUmpleDiagnostics(
+  stderr: string,
+  stdout: string,
+  document: TextDocument,
+): Diagnostic[] {
+  const jsonDiagnostics = parseUmpleJsonDiagnostics(stderr, document);
   if (jsonDiagnostics.length === 0 && stdout.includes("Success")) {
     connection.console.info("Umple compile succeeded.");
   }
@@ -311,7 +312,10 @@ type UmpleJsonResult = {
   message?: string;
 };
 
-function parseUmpleJsonDiagnostics(stderr: string): Diagnostic[] {
+function parseUmpleJsonDiagnostics(
+  stderr: string,
+  document: TextDocument,
+): Diagnostic[] {
   const trimmed = stderr.trim();
   if (!trimmed) {
     return [];
@@ -328,9 +332,12 @@ function parseUmpleJsonDiagnostics(stderr: string): Diagnostic[] {
       return [];
     }
 
+    const lines = document.getText().split(/\r?\n/);
+
     return parsed.results.map((result) => {
       console.log(result);
       const lineNumber = Math.max(Number(result.line ?? "1") - 1, 0);
+      const lineText = lines[lineNumber] ?? "";
       const severityValue = Number(result.severity ?? "3");
       const severity =
         severityValue > 2
@@ -349,7 +356,7 @@ function parseUmpleJsonDiagnostics(stderr: string): Diagnostic[] {
         severity,
         range: {
           start: { line: lineNumber, character: 0 },
-          end: { line: lineNumber, character: 1 },
+          end: { line: lineNumber, character: lineText.length },
         },
         message: details.join(": "),
         source: "umple",
