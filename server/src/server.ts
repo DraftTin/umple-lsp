@@ -4,6 +4,8 @@ import * as net from "net";
 import * as os from "os";
 import * as path from "path";
 import {
+  CompletionItem,
+  CompletionItemKind,
   createConnection,
   Diagnostic,
   DiagnosticSeverity,
@@ -25,6 +27,22 @@ let umpleSyncHost = "localhost";
 let umpleSyncPort = 5555;
 let jarWarningShown = false;
 let serverProcess: ChildProcess | undefined;
+
+const KEYWORD_COMPLETIONS: CompletionItem[] = [
+  { label: "class", kind: CompletionItemKind.Keyword },
+  { label: "trait", kind: CompletionItemKind.Keyword },
+  { label: "association", kind: CompletionItemKind.Keyword },
+  { label: "enum", kind: CompletionItemKind.Keyword },
+  { label: "namespace", kind: CompletionItemKind.Keyword },
+  { label: "stateMachine", kind: CompletionItemKind.Keyword },
+  { label: "event", kind: CompletionItemKind.Keyword },
+  { label: "attribute", kind: CompletionItemKind.Keyword },
+  { label: "use", kind: CompletionItemKind.Keyword },
+  { label: "generate", kind: CompletionItemKind.Keyword },
+  { label: "extends", kind: CompletionItemKind.Keyword },
+  { label: "implements", kind: CompletionItemKind.Keyword },
+  { label: "abstract", kind: CompletionItemKind.Keyword },
+];
 
 connection.onInitialize((params: InitializeParams): InitializeResult => {
   const initOptions = params.initializationOptions as
@@ -49,6 +67,10 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
   return {
     capabilities: {
       textDocumentSync: TextDocumentSyncKind.Incremental,
+      completionProvider: {
+        resolveProvider: false,
+        triggerCharacters: [" ", "."],
+      },
     },
   };
 });
@@ -86,6 +108,22 @@ connection.onDidChangeTextDocument((params) => {
 connection.onDidCloseTextDocument((params) => {
   documents.delete(params.textDocument.uri);
   connection.sendDiagnostics({ uri: params.textDocument.uri, diagnostics: [] });
+});
+
+connection.onCompletion((params): CompletionItem[] => {
+  const document = documents.get(params.textDocument.uri);
+  if (!document) {
+    return KEYWORD_COMPLETIONS;
+  }
+
+  const prefix = getCompletionPrefix(
+    document,
+    params.position.line,
+    params.position.character,
+  );
+  const keywordItems = filterCompletions(KEYWORD_COMPLETIONS, prefix);
+  const classItems = getClassNameCompletions(prefix);
+  return [...keywordItems, ...classItems];
 });
 
 function scheduleValidation(document: TextDocument): void {
@@ -335,12 +373,9 @@ function parseUmpleJsonDiagnostics(
     }
 
     const lines = document.getText().split(/\r?\n/);
-
     return parsed.results.map((result) => {
-      console.log(result);
       const lineNumber = Math.max(Number(result.line ?? "1") - 1, 0);
       const lineText = lines[lineNumber] ?? "";
-      console.log(lineText);
       const firstNonSpace = lineText.search(/\S/);
       const startChar = firstNonSpace === -1 ? 0 : firstNonSpace;
       const severityValue = Number(result.severity ?? "3");
@@ -370,6 +405,50 @@ function parseUmpleJsonDiagnostics(
   } catch {
     return [];
   }
+}
+
+function getCompletionPrefix(
+  document: TextDocument,
+  line: number,
+  character: number,
+): string {
+  const lineText = document.getText(
+    Range.create(Position.create(line, 0), Position.create(line, character)),
+  );
+  const match = lineText.match(/[A-Za-z_][A-Za-z0-9_]*$/);
+  return match ? match[0] : "";
+}
+
+function filterCompletions(
+  items: CompletionItem[],
+  prefix: string,
+): CompletionItem[] {
+  if (!prefix) {
+    return items;
+  }
+  const lowerPrefix = prefix.toLowerCase();
+  return items.filter((item) =>
+    item.label.toLowerCase().startsWith(lowerPrefix),
+  );
+}
+
+function getClassNameCompletions(prefix: string): CompletionItem[] {
+  const classNames = new Set<string>();
+  for (const document of documents.values()) {
+    const text = document.getText();
+    const regex = /\b(class|trait)\s+([A-Za-z_][A-Za-z0-9_]*)/g;
+    let match: RegExpExecArray | null;
+    while ((match = regex.exec(text)) !== null) {
+      classNames.add(match[2]);
+    }
+  }
+
+  const items = Array.from(classNames).map((name) => ({
+    label: name,
+    kind: CompletionItemKind.Class,
+  }));
+
+  return filterCompletions(items, prefix);
 }
 
 function extractJson(text: string): string | null {
