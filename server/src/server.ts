@@ -22,6 +22,10 @@ import { ALL_KEYWORDS, KEYWORDS } from "./keywords";
 const connection = createConnection(ProposedFeatures.all);
 const documents = new Map<string, TextDocument>();
 const pendingValidations = new Map<string, NodeJS.Timeout>();
+const modelCache = new Map<
+  string,
+  { version: number; items: CompletionItem[] }
+>();
 
 let umpleSyncJarPath: string | undefined;
 let umpleSyncHost = "localhost";
@@ -98,15 +102,17 @@ connection.onDidChangeTextDocument((params) => {
     params.textDocument.version,
   );
   documents.set(params.textDocument.uri, updated);
+  modelCache.delete(params.textDocument.uri);
   scheduleValidation(updated);
 });
 
 connection.onDidCloseTextDocument((params) => {
   documents.delete(params.textDocument.uri);
+  modelCache.delete(params.textDocument.uri);
   connection.sendDiagnostics({ uri: params.textDocument.uri, diagnostics: [] });
 });
 
-connection.onCompletion((params): CompletionItem[] => {
+connection.onCompletion(async (params): Promise<CompletionItem[]> => {
   const document = documents.get(params.textDocument.uri);
   if (!document) {
     return KEYWORD_COMPLETIONS;
@@ -117,7 +123,6 @@ connection.onCompletion((params): CompletionItem[] => {
     params.position.line,
     params.position.character,
   );
-  console.log("context: ", context);
   const prefix = getCompletionPrefix(
     document,
     params.position.line,
@@ -127,8 +132,13 @@ connection.onCompletion((params): CompletionItem[] => {
     buildKeywordCompletions(getKeywordsForContext(context)),
     prefix,
   );
+  const modelItems = await getModelCompletions(document);
   const classItems = getClassNameCompletions(prefix);
-  return [...keywordItems, ...classItems];
+  return dedupeCompletions([
+    ...keywordItems,
+    ...filterCompletions(modelItems, prefix),
+    ...classItems,
+  ]);
 });
 
 function scheduleValidation(document: TextDocument): void {
@@ -186,8 +196,10 @@ async function runUmpleSyncAndParseDiagnostics(
   );
   const tempFile = path.join(tempDir, "document.ump");
   let text = document.getText();
-  // If the error is at the last line, it needs to add newlines to let compiler recognize its position correctly
-  text += "\n\n";
+  // Umple needs two trailing newlines to report end-of-file errors on the last line.
+  if (!text.endsWith("\n\n")) {
+    text = text.replace(/\n?$/, "\n\n");
+  }
   await fs.promises.writeFile(tempFile, text, "utf8");
 
   try {
@@ -616,6 +628,202 @@ function getClassNameCompletions(prefix: string): CompletionItem[] {
   }));
 
   return filterCompletions(items, prefix);
+}
+
+async function getModelCompletions(
+  document: TextDocument,
+): Promise<CompletionItem[]> {
+  const cached = modelCache.get(document.uri);
+  if (cached && cached.version === document.version) {
+    return cached.items;
+  }
+
+  let items: CompletionItem[] = [];
+  try {
+    const modelJson = await generateModelJson(document);
+    if (modelJson) {
+      items = buildModelCompletions(modelJson);
+    }
+  } catch (error) {
+    connection.console.warn(
+      `Failed to build model completions: ${String(error)}`,
+    );
+  }
+  modelCache.set(document.uri, { version: document.version, items });
+
+  return items;
+}
+
+async function generateModelJson(
+  document: TextDocument,
+): Promise<unknown | null> {
+  const jarPath = resolveJarPath();
+  if (!jarPath) {
+    return null;
+  }
+
+  const tempDir = await fs.promises.mkdtemp(
+    path.join(os.tmpdir(), "umple-lsp-model-"),
+  );
+  const tempFile = path.join(tempDir, "document.ump");
+  let text = document.getText();
+  if (!text.endsWith("\n\n")) {
+    text = text.replace(/\n?$/, "\n\n");
+  }
+  await fs.promises.writeFile(tempFile, text, "utf8");
+
+  try {
+    const commandLine = `-generate JsonMixed ${tempFile}`;
+    const { stdout } = await sendUmpleSyncCommand(jarPath, commandLine);
+    const jsonText = extractJson(stdout);
+    if (!jsonText) {
+      return null;
+    }
+    return JSON.parse(jsonText);
+  } finally {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+function buildModelCompletions(modelJson: unknown): CompletionItem[] {
+  const items: CompletionItem[] = [];
+  const seen = new Set<string>();
+  const model = modelJson as {
+    umpleClasses?: Array<{
+      name?: string;
+      attributes?: Array<{ name?: string; type?: string }>;
+      stateMachines?: Array<{
+        name?: string;
+        states?: Array<{ name?: string }>;
+        transitions?: Array<{
+          labels?: Array<{
+            attrs?: { text?: { text?: string } };
+          }>;
+        }>;
+      }>;
+    }>;
+    umpleAssociations?: Array<{
+      name?: string;
+      classOneId?: string;
+      classTwoId?: string;
+    }>;
+  };
+
+  // umple classes
+  for (const umpleClass of model.umpleClasses ?? []) {
+    // class name
+    const className = umpleClass.name;
+    if (className) {
+      addCompletion(items, seen, {
+        label: className,
+        kind: CompletionItemKind.Class,
+        detail: "class",
+      });
+    }
+    // attributes
+    for (const attr of umpleClass.attributes ?? []) {
+      if (!attr.name) {
+        continue;
+      }
+      const detail = attr.type ? `${attr.type} attribute` : "attribute";
+      addCompletion(items, seen, {
+        label: attr.name,
+        kind: CompletionItemKind.Field,
+        detail: className ? `${detail} in ${className}` : detail,
+      });
+    }
+
+    // statemachines
+    for (const sm of umpleClass.stateMachines ?? []) {
+      // state names
+      for (const state of sm.states ?? []) {
+        if (!state.name) {
+          continue;
+        }
+        addCompletion(items, seen, {
+          label: state.name,
+          kind: CompletionItemKind.EnumMember,
+          detail: "state",
+        });
+      }
+
+      // transition
+      for (const transition of sm.transitions ?? []) {
+        for (const label of transition.labels ?? []) {
+          const text = label?.attrs?.text?.text;
+          const eventName = extractEventName(text);
+          if (!eventName) {
+            continue;
+          }
+          addCompletion(items, seen, {
+            label: eventName,
+            kind: CompletionItemKind.Event,
+            detail: "event",
+          });
+        }
+      }
+    }
+  }
+
+  for (const assoc of model.umpleAssociations ?? []) {
+    const name =
+      assoc.name ??
+      (assoc.classOneId && assoc.classTwoId
+        ? `${assoc.classOneId}__${assoc.classTwoId}`
+        : undefined);
+    if (!name) {
+      continue;
+    }
+    addCompletion(items, seen, {
+      label: name,
+      kind: CompletionItemKind.Property,
+      detail: "association",
+    });
+  }
+
+  return items;
+}
+
+function extractEventName(labelText: string | undefined): string | null {
+  if (!labelText) {
+    return null;
+  }
+  const trimmed = labelText.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const stopIndex = trimmed.search(/\s*\[|\s*\/\s*/);
+  if (stopIndex === -1) {
+    return trimmed;
+  }
+  return trimmed.slice(0, stopIndex).trim();
+}
+
+function addCompletion(
+  items: CompletionItem[],
+  seen: Set<string>,
+  item: CompletionItem,
+): void {
+  const key = `${item.kind ?? "text"}:${item.label}`;
+  if (seen.has(key)) {
+    return;
+  }
+  seen.add(key);
+  items.push(item);
+}
+
+function dedupeCompletions(items: CompletionItem[]): CompletionItem[] {
+  const seen = new Set<string>();
+  const result: CompletionItem[] = [];
+  for (const item of items) {
+    const key = `${item.kind ?? "text"}:${item.label}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(item);
+  }
+  return result;
 }
 
 function extractJson(text: string): string | null {
