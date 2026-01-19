@@ -34,7 +34,7 @@ const KEYWORD_COMPLETIONS: CompletionItem[] = [
   { label: "association", kind: CompletionItemKind.Keyword },
   { label: "enum", kind: CompletionItemKind.Keyword },
   { label: "namespace", kind: CompletionItemKind.Keyword },
-  { label: "stateMachine", kind: CompletionItemKind.Keyword },
+  { label: "statemachine", kind: CompletionItemKind.Keyword },
   { label: "event", kind: CompletionItemKind.Keyword },
   { label: "attribute", kind: CompletionItemKind.Keyword },
   { label: "use", kind: CompletionItemKind.Keyword },
@@ -180,7 +180,10 @@ async function runUmpleSyncAndParseDiagnostics(
     path.join(os.tmpdir(), "umple-lsp-"),
   );
   const tempFile = path.join(tempDir, "document.ump");
-  await fs.promises.writeFile(tempFile, document.getText(), "utf8");
+  let text = document.getText();
+  // If the error is at the last line, it needs to add newlines to let compiler recognize its position correctly
+  text += "\n\n";
+  await fs.promises.writeFile(tempFile, text, "utf8");
 
   try {
     const commandLine = `-generate nothing ${tempFile}`;
