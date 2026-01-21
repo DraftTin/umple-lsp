@@ -29,6 +29,8 @@ export function activate(context: vscode.ExtensionContext): void {
     initializationOptions: {
       umpleSyncJarPath: context.asAbsolutePath("umplesync.jar"),
       umpleSyncPort: 5556,
+      umpleJarPath: context.asAbsolutePath("umple.jar"),
+      umpleGoToDefClasspath: context.asAbsolutePath("poc"),
     },
     synchronize: {
       fileEvents: vscode.workspace.createFileSystemWatcher("**/*.ump"),
