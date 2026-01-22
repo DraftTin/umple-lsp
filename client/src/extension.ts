@@ -30,7 +30,7 @@ export function activate(context: vscode.ExtensionContext): void {
       umpleSyncJarPath: context.asAbsolutePath("umplesync.jar"),
       umpleSyncPort: 5556,
       umpleJarPath: context.asAbsolutePath("umple.jar"),
-      umpleGoToDefClasspath: context.asAbsolutePath("poc"),
+      umpleGoToDefClasspath: context.asAbsolutePath("java-tools"),
     },
     synchronize: {
       fileEvents: vscode.workspace.createFileSystemWatcher("**/*.ump"),
