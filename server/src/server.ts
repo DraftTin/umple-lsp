@@ -29,17 +29,21 @@ const modelCache = new Map<
   string,
   { version: number; items: CompletionItem[] }
 >();
+const shadowWorkspaces = new Map<string, ShadowWorkspaceState>();
 let workspaceRoots: string[] = [];
+let goToDefClient: GoToDefServerClient | null = null;
 
 let umpleSyncJarPath: string | undefined;
 let umpleSyncHost = "localhost";
 let umpleSyncPort = 5555;
+let umpleSyncTimeoutMs = 50000;
 let jarWarningShown = false;
 let serverProcess: ChildProcess | undefined;
 let umpleJarPath: string | undefined;
 let umpleGoToDefClasspath: string | undefined;
 
 const execFileAsync = promisify(execFile);
+const DEFAULT_UMPLESYNC_TIMEOUT_MS = 50000;
 
 const KEYWORD_COMPLETIONS: CompletionItem[] =
   buildKeywordCompletions(ALL_KEYWORDS);
@@ -58,6 +62,7 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
         umpleSyncJarPath?: string;
         umpleSyncHost?: string;
         umpleSyncPort?: number;
+        umpleSyncTimeoutMs?: number;
         umpleJarPath?: string;
         umpleGoToDefClasspath?: string;
       }
@@ -74,6 +79,16 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
     if (!Number.isNaN(parsed)) {
       umpleSyncPort = parsed;
     }
+  }
+  if (typeof initOptions?.umpleSyncTimeoutMs === "number") {
+    umpleSyncTimeoutMs = initOptions.umpleSyncTimeoutMs;
+  } else if (process.env.UMPLESYNC_TIMEOUT_MS) {
+    const parsed = Number(process.env.UMPLESYNC_TIMEOUT_MS);
+    if (!Number.isNaN(parsed)) {
+      umpleSyncTimeoutMs = parsed;
+    }
+  } else {
+    umpleSyncTimeoutMs = DEFAULT_UMPLESYNC_TIMEOUT_MS;
   }
 
   workspaceRoots = resolveWorkspaceRoots(params);
@@ -148,11 +163,11 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
     prefix,
   );
   const modelItems = await getModelCompletions(document);
-  const classItems = getClassNameCompletions(prefix);
+  // const classItems = getClassNameCompletions(prefix);
   return dedupeCompletions([
     ...keywordItems,
     ...filterCompletions(modelItems, prefix),
-    ...classItems,
+    // ...classItems,
   ]);
 });
 
@@ -162,16 +177,22 @@ connection.onDefinition(async (params) => {
     return [];
   }
 
+  const useLocation = resolveUseDefinitionFromLine(document, params.position);
+  if (useLocation) {
+    return [useLocation];
+  }
+
   const settings = resolveGoToDefSettings();
   if (!settings) {
     return [];
   }
 
   const { jarPath, classpath } = settings;
-  const shadowInfo = await createShadowWorkspace(document, "def");
-  const tempFileInfo =
-    shadowInfo ?? (await writeTempUmpleFile(document, "def"));
-  const tempFile = tempFileInfo.filePath;
+  const shadowInfo = await getOrCreateShadowWorkspace(document, "def");
+  const tempFileInfo = shadowInfo
+    ? null
+    : await writeTempUmpleFile(document, "def");
+  const tempFile = shadowInfo ? shadowInfo.filePath : tempFileInfo!.filePath;
   if (!shadowInfo) {
     let text = document.getText();
     if (!text.endsWith("\n\n")) {
@@ -181,22 +202,19 @@ connection.onDefinition(async (params) => {
   }
 
   try {
-    const classPath = [jarPath, classpath].join(path.delimiter);
     const line = params.position.line + 1;
     const col = params.position.character;
-    const { stdout } = await execFileAsync(
-      "java",
-      [
-        "-cp",
-        classPath,
-        "UmpleGoToDefJson",
-        tempFile,
-        String(line),
-        String(col),
-      ],
-      { encoding: "utf8", timeout: 5000 },
-    );
-    const def = parseGoToDefOutput(stdout);
+    let def: GoToDefResult | null = null;
+    try {
+      const client = getGoToDefClient({ jarPath, classpath });
+      def = await client.request(tempFile, line, col);
+    } catch (error) {
+      // Fall back to one-shot execution if the daemon fails.
+      connection.console.warn(
+        `Go-to-definition daemon failed: ${String(error)}`,
+      );
+      def = await runGoToDefOnce(jarPath, classpath, tempFile, line, col);
+    }
 
     if (!def?.found) {
       return [];
@@ -224,7 +242,9 @@ connection.onDefinition(async (params) => {
     connection.console.warn(`Go to definition failed: ${String(error)}`);
     return [];
   } finally {
-    await tempFileInfo.cleanup();
+    if (tempFileInfo) {
+      await tempFileInfo.cleanup();
+    }
   }
 });
 
@@ -246,8 +266,16 @@ async function validateTextDocument(document: TextDocument): Promise<void> {
     return;
   }
 
-  const diagnostics = await runUmpleSyncAndParseDiagnostics(jarPath, document);
-  connection.sendDiagnostics({ uri: document.uri, diagnostics });
+  try {
+    const diagnostics = await runUmpleSyncAndParseDiagnostics(
+      jarPath,
+      document,
+    );
+    connection.sendDiagnostics({ uri: document.uri, diagnostics });
+  } catch (error) {
+    connection.console.error(`Diagnostics failed: ${String(error)}`);
+    connection.sendDiagnostics({ uri: document.uri, diagnostics: [] });
+  }
 }
 
 function resolveJarPath(): string | undefined {
@@ -304,6 +332,36 @@ function resolveGoToDefSettings():
   return { jarPath: umpleJarPath, classpath: umpleGoToDefClasspath };
 }
 
+function getGoToDefClient(settings: {
+  jarPath: string;
+  classpath: string;
+}): GoToDefServerClient {
+  if (goToDefClient && goToDefClient.matches(settings)) {
+    return goToDefClient;
+  }
+  if (goToDefClient) {
+    goToDefClient.dispose();
+  }
+  goToDefClient = new GoToDefServerClient(settings);
+  return goToDefClient;
+}
+
+async function runGoToDefOnce(
+  jarPath: string,
+  classpath: string,
+  tempFile: string,
+  line: number,
+  col: number,
+): Promise<GoToDefResult | null> {
+  const classPath = [jarPath, classpath].join(path.delimiter);
+  const { stdout } = await execFileAsync(
+    "java",
+    ["-cp", classPath, "UmpleGoToDefJson", tempFile, String(line), String(col)],
+    { encoding: "utf8", timeout: 50000 },
+  );
+  return parseGoToDefOutput(stdout);
+}
+
 async function runUmpleSyncAndParseDiagnostics(
   jarPath: string,
   document: TextDocument,
@@ -311,6 +369,7 @@ async function runUmpleSyncAndParseDiagnostics(
   const tempFileInfo = await writeTempUmpleFile(document, "diag");
   const tempFile = tempFileInfo.filePath;
   let text = document.getText();
+  text = sanitizeUseStatements(text);
   // Umple needs two trailing newlines to report end-of-file errors on the last line.
   if (!text.endsWith("\n\n")) {
     text = text.replace(/\n?$/, "\n\n");
@@ -318,7 +377,7 @@ async function runUmpleSyncAndParseDiagnostics(
   await fs.promises.writeFile(tempFile, text, "utf8");
 
   try {
-    const commandLine = `-generate nothing ${tempFile}`;
+    const commandLine = `-generate nothing ${formatUmpleArg(tempFile)}`;
     const { stdout, stderr } = await sendUmpleSyncCommand(jarPath, commandLine);
     return parseUmpleDiagnostics(stderr, stdout, document);
   } finally {
@@ -364,9 +423,28 @@ function connectAndSend(
   return new Promise((resolve, reject) => {
     const socket = new net.Socket();
     const chunks: string[] = [];
+    let settled = false;
+
+    const finishSuccess = (raw: string) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      const { stdout, stderr } = splitUmpleSyncOutput(raw);
+      resolve({ stdout, stderr });
+    };
+
+    const finishError = (err: Error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      socket.destroy();
+      reject(err);
+    };
 
     socket.setEncoding("utf8");
-    socket.setTimeout(2000);
+    socket.setTimeout(umpleSyncTimeoutMs);
 
     socket.on("data", (chunk) => {
       if (typeof chunk === "string") {
@@ -377,18 +455,16 @@ function connectAndSend(
     });
 
     socket.on("end", () => {
-      const raw = chunks.join("");
-      const { stdout, stderr } = splitUmpleSyncOutput(raw);
-      resolve({ stdout, stderr });
+      finishSuccess(chunks.join(""));
     });
 
     socket.on("error", (err) => {
-      socket.destroy();
-      reject(err);
+      const error = err instanceof Error ? err : new Error(String(err));
+      finishError(error);
     });
 
     socket.on("timeout", () => {
-      socket.destroy(new Error("umplesync socket timeout"));
+      finishError(new Error("umplesync socket timeout"));
     });
 
     socket.connect(umpleSyncPort, umpleSyncHost, () => {
@@ -449,20 +525,157 @@ function splitUmpleSyncOutput(raw: string): { stdout: string; stderr: string } {
   return { stdout, stderr };
 }
 
+function sanitizeUseStatements(text: string): string {
+  const lines = text.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (/^\s*use\b/.test(line)) {
+      lines[i] = `//${line}`;
+    }
+  }
+  return lines.join("\n");
+}
+
 function isConnectionError(error: unknown): boolean {
   if (!error || typeof error !== "object") {
     return false;
   }
-  const maybeError = error as { code?: string };
+  const maybeError = error as { code?: string; message?: string };
   return (
     maybeError.code === "ECONNREFUSED" ||
     maybeError.code === "ECONNRESET" ||
-    maybeError.code === "EPIPE"
+    maybeError.code === "EPIPE" ||
+    maybeError.code === "ETIMEDOUT" ||
+    (maybeError.message || "").includes("umplesync socket timeout")
   );
 }
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+class GoToDefServerClient {
+  private process: ChildProcess | null = null;
+  private buffer = "";
+  private nextId = 1;
+  private pending = new Map<
+    number,
+    {
+      resolve: (value: GoToDefResult | null) => void;
+      reject: (error: Error) => void;
+    }
+  >();
+  private settings: { jarPath: string; classpath: string };
+
+  constructor(settings: { jarPath: string; classpath: string }) {
+    this.settings = settings;
+  }
+
+  matches(settings: { jarPath: string; classpath: string }): boolean {
+    return (
+      this.settings.jarPath === settings.jarPath &&
+      this.settings.classpath === settings.classpath
+    );
+  }
+
+  dispose(): void {
+    if (this.process) {
+      this.process.kill();
+      this.process = null;
+    }
+    this.pending.clear();
+  }
+
+  async request(
+    file: string,
+    line: number,
+    col: number,
+  ): Promise<GoToDefResult | null> {
+    this.ensureProcess();
+    const id = this.nextId++;
+    const payload = JSON.stringify({ id, file, line, col });
+
+    return new Promise((resolve, reject) => {
+      const process = this.process;
+      if (!process || !process.stdin) {
+        reject(new Error("Go-to-definition daemon not running"));
+        return;
+      }
+
+      this.pending.set(id, { resolve, reject });
+      // Send one request per line to the daemon.
+      process.stdin.write(`${payload}\n`, "utf8", (err) => {
+        if (err) {
+          this.pending.delete(id);
+          reject(err);
+        }
+      });
+    });
+  }
+
+  private ensureProcess(): void {
+    if (this.process) {
+      return;
+    }
+    // Start the Java daemon once and reuse it.
+    const classPath = [this.settings.jarPath, this.settings.classpath].join(
+      path.delimiter,
+    );
+    const child = spawn(
+      "java",
+      ["-cp", classPath, "UmpleGoToDefJson", "--server"],
+      {
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+    this.process = child;
+    child.stdout?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk) => {
+      this.buffer += chunk;
+      this.flushBuffer();
+    });
+    child.stderr?.on("data", (chunk) => {
+      connection.console.warn(`Go-to-definition daemon stderr: ${chunk}`);
+    });
+    child.on("exit", (code) => {
+      const error = new Error(`Go-to-definition daemon exited: ${code}`);
+      for (const entry of this.pending.values()) {
+        entry.reject(error);
+      }
+      this.pending.clear();
+      this.process = null;
+    });
+  }
+
+  private flushBuffer(): void {
+    let newlineIndex = this.buffer.indexOf("\n");
+    while (newlineIndex !== -1) {
+      const line = this.buffer.slice(0, newlineIndex).trim();
+      this.buffer = this.buffer.slice(newlineIndex + 1);
+      if (line) {
+        this.handleResponseLine(line);
+      }
+      newlineIndex = this.buffer.indexOf("\n");
+    }
+  }
+
+  private handleResponseLine(line: string): void {
+    let parsed: GoToDefServerResponse | null = null;
+    try {
+      parsed = JSON.parse(line) as GoToDefServerResponse;
+    } catch {
+      connection.console.warn(
+        `Go-to-definition daemon sent invalid JSON: ${line}`,
+      );
+      return;
+    }
+    const pending = this.pending.get(parsed.id);
+    if (!pending) {
+      return;
+    }
+    this.pending.delete(parsed.id);
+    pending.resolve(parsed);
+  }
 }
 
 function parseUmpleDiagnostics(
@@ -496,11 +709,18 @@ type GoToDefResult = {
   col?: number;
 };
 
+type GoToDefServerResponse = GoToDefResult & { id: number };
+
 type ShadowWorkspace = {
   filePath: string;
   shadowRoot: string;
   workspaceRoot: string;
-  cleanup: () => Promise<void>;
+};
+
+type ShadowWorkspaceState = {
+  shadowRoot: string;
+  workspaceRoot: string;
+  docVersions: Map<string, number>;
 };
 
 function parseUmpleJsonDiagnostics(
@@ -647,7 +867,7 @@ function resolveWorkspaceRoots(params: InitializeParams): string[] {
   return roots;
 }
 
-async function createShadowWorkspace(
+async function getOrCreateShadowWorkspace(
   document: TextDocument,
   label: string,
 ): Promise<ShadowWorkspace | null> {
@@ -660,21 +880,32 @@ async function createShadowWorkspace(
     return null;
   }
 
-  const shadowRoot = await fs.promises.mkdtemp(
-    path.join(os.tmpdir(), `umple-shadow-${label}-`),
+  let state = shadowWorkspaces.get(workspaceRoot);
+  if (!state) {
+    const shadowRoot = await fs.promises.mkdtemp(
+      path.join(os.tmpdir(), `umple-shadow-${label}-`),
+    );
+    await mirrorWorkspaceUmpleFiles(workspaceRoot, shadowRoot);
+    state = {
+      shadowRoot,
+      workspaceRoot,
+      docVersions: new Map(),
+    };
+    shadowWorkspaces.set(workspaceRoot, state);
+  }
+
+  await overlayOpenDocumentsCached(
+    workspaceRoot,
+    state.shadowRoot,
+    state.docVersions,
   );
-  await mirrorWorkspaceUmpleFiles(workspaceRoot, shadowRoot);
-  await overlayOpenDocuments(workspaceRoot, shadowRoot);
 
   const relative = path.relative(workspaceRoot, docPath);
-  const filePath = path.join(shadowRoot, relative);
+  const filePath = path.join(state.shadowRoot, relative);
   return {
     filePath,
-    shadowRoot,
+    shadowRoot: state.shadowRoot,
     workspaceRoot,
-    cleanup: async () => {
-      await fs.promises.rm(shadowRoot, { recursive: true, force: true });
-    },
   };
 }
 
@@ -692,13 +923,19 @@ function isPathInside(filePath: string, root: string): boolean {
   return !relative.startsWith("..") && !path.isAbsolute(relative);
 }
 
-async function overlayOpenDocuments(
+async function overlayOpenDocumentsCached(
   workspaceRoot: string,
   shadowRoot: string,
+  docVersions: Map<string, number>,
 ): Promise<void> {
   for (const doc of documents.values()) {
     const docPath = getDocumentFilePath(doc);
     if (!docPath || !isPathInside(docPath, workspaceRoot)) {
+      continue;
+    }
+    const currentVersion = doc.version;
+    const cachedVersion = docVersions.get(doc.uri);
+    if (cachedVersion === currentVersion) {
       continue;
     }
     const relative = path.relative(workspaceRoot, docPath);
@@ -710,6 +947,7 @@ async function overlayOpenDocuments(
       text = text.replace(/\n?$/, "\n\n");
     }
     await fs.promises.writeFile(target, text, "utf8");
+    docVersions.set(doc.uri, currentVersion);
   }
 }
 
@@ -813,6 +1051,51 @@ function getDocumentFilePath(document: TextDocument): string | null {
   } catch {
     return null;
   }
+}
+
+function resolveUseDefinitionFromLine(
+  document: TextDocument,
+  position: Position,
+): Location | null {
+  const docPath = getDocumentFilePath(document);
+  if (!docPath) {
+    return null;
+  }
+  const lines = document.getText().split(/\r?\n/);
+  const lineText = lines[position.line] ?? "";
+  const trimmed = lineText.trim();
+  if (!trimmed.startsWith("use")) {
+    return null;
+  }
+  const cleaned = lineText.split("//")[0];
+  const match = cleaned.match(/\buse\s+([^;]+);/);
+  if (!match) {
+    return null;
+  }
+  const fileRef = extractUmpleFilename(match[1]);
+  if (!fileRef) {
+    return null;
+  }
+
+  const baseDir = path.dirname(docPath);
+  const targetPath = path.isAbsolute(fileRef)
+    ? fileRef
+    : path.join(baseDir, fileRef);
+  const uri = pathToFileURL(targetPath).toString();
+  return Location.create(
+    uri,
+    Range.create(Position.create(0, 0), Position.create(0, 0)),
+  );
+}
+
+function extractUmpleFilename(text: string): string | null {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const cleaned = trimmed.replace(/^[\"']+/, "").replace(/[\"';]+$/, "");
+  const match = cleaned.match(/([A-Za-z0-9_./\\-]+\.ump)/);
+  return match ? match[1] : null;
 }
 
 function getCompletionPrefix(
@@ -1059,7 +1342,7 @@ async function generateModelJson(
   await fs.promises.writeFile(tempFile, text, "utf8");
 
   try {
-    const commandLine = `-generate JsonMixed ${tempFile}`;
+    const commandLine = `-generate JsonMixed ${formatUmpleArg(tempFile)}`;
     const { stdout } = await sendUmpleSyncCommand(jarPath, commandLine);
     const jsonText = extractJson(stdout);
     if (!jsonText) {
@@ -1219,6 +1502,10 @@ function extractJson(text: string): string | null {
     return null;
   }
   return text.slice(start, end + 1);
+}
+
+function formatUmpleArg(filePath: string): string {
+  return JSON.stringify(filePath);
 }
 
 connection.listen();
