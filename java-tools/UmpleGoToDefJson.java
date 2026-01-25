@@ -16,12 +16,22 @@ import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.security.MessageDigest;
 import java.util.List;
-import java.util.HashMap;
 import java.util.Map;
+import java.util.Base64;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class UmpleGoToDefJson {
+  private static final int ANALYZE_DEBOUNCE_MS = 400;
+  private static final ScheduledExecutorService ANALYZE_EXECUTOR =
+    Executors.newSingleThreadScheduledExecutor();
+  private static final Map<String, ScheduledFuture<?>> PENDING_ANALYSIS =
+    new ConcurrentHashMap<>();
   public static void main(String[] args) throws Exception {
     if (args.length == 1 && "--server".equals(args[0])) {
       runServer();
@@ -91,7 +101,13 @@ public class UmpleGoToDefJson {
     int col;
   }
 
-  private static final Map<String, CacheEntry> MODEL_CACHE = new HashMap<>();
+  private static class UpdateRequest {
+    String file;
+    int version;
+    String text;
+  }
+
+  private static final Map<String, CacheEntry> MODEL_CACHE = new ConcurrentHashMap<>();
 
   private static void runServer() throws Exception {
     // Simple line-based JSON protocol over stdin/stdout.
@@ -104,6 +120,12 @@ public class UmpleGoToDefJson {
       if (line.isEmpty()) {
         continue;
       }
+      String type = extractJsonString(line, "type");
+      if ("update".equals(type)) {
+        handleUpdate(line);
+        continue;
+      }
+
       Request request = parseRequest(line);
       if (request == null) {
         System.out.println("{\"found\":false}");
@@ -129,20 +151,17 @@ public class UmpleGoToDefJson {
     String text = Files.readString(inputFile.toPath());
     String semanticHash = hashSemantic(text);
 
+    ScheduledFuture<?> pending = PENDING_ANALYSIS.remove(request.file);
+    if (pending != null) {
+      pending.cancel(false);
+    }
+
     CacheEntry cached = MODEL_CACHE.get(request.file);
     if (cached == null || !semanticHash.equals(cached.semanticHash)) {
-      // Rebuild the model only when semantic content changes.
-      UmpleFile umpleFile = new UmpleFile(request.file);
-      UmpleModel model = new UmpleModel(umpleFile);
-      UmpleInternalParser modelParser = new UmpleInternalParser();
-      modelParser.setModel(model);
-      modelParser.setFilename(request.file);
-      ParseResult result = modelParser.getParser().parse(inputFile);
-      modelParser.setParseResult(result);
-      modelParser.setRootToken(modelParser.getParser().getRootToken());
-      modelParser.analyze(false);
-      cached = new CacheEntry(semanticHash, model);
-      MODEL_CACHE.put(request.file, cached);
+      cached = analyzeNow(request.file, semanticHash);
+      if (cached == null) {
+        return null;
+      }
     }
 
     String sanitized = sanitizeUseStatements(text);
@@ -159,6 +178,72 @@ public class UmpleGoToDefJson {
     return resolveDefinition(token, cached.model, request.file, request.line, request.col);
   }
 
+  private static void handleUpdate(String line) throws Exception {
+    UpdateRequest update = parseUpdate(line);
+    if (update == null) {
+      return;
+    }
+    if (!update.text.endsWith("\n\n")) {
+      update.text = update.text.replaceAll("\\n?$", "\n\n");
+    }
+
+    File target = new File(update.file);
+    File parent = target.getParentFile();
+    if (parent != null && !parent.isDirectory()) {
+      parent.mkdirs();
+    }
+    Files.writeString(target.toPath(), update.text, StandardCharsets.UTF_8);
+
+    String semanticHash = hashSemantic(update.text);
+    CacheEntry cached = MODEL_CACHE.get(update.file);
+    if (cached != null && semanticHash.equals(cached.semanticHash)) {
+      return;
+    }
+
+    scheduleAnalyze(update.file, semanticHash);
+  }
+
+  private static CacheEntry analyzeNow(String filename, String semanticHash) throws Exception {
+    File inputFile = new File(filename);
+    if (!inputFile.isFile()) {
+      return null;
+    }
+    // Build the model for this file.
+    UmpleFile umpleFile = new UmpleFile(filename);
+    UmpleModel model = new UmpleModel(umpleFile);
+    UmpleInternalParser modelParser = new UmpleInternalParser();
+    modelParser.setModel(model);
+    modelParser.setFilename(filename);
+    ParseResult result = modelParser.getParser().parse(inputFile);
+    modelParser.setParseResult(result);
+    modelParser.setRootToken(modelParser.getParser().getRootToken());
+    modelParser.analyze(false);
+    CacheEntry entry = new CacheEntry(semanticHash, model);
+    MODEL_CACHE.put(filename, entry);
+    return entry;
+  }
+
+  private static void scheduleAnalyze(String filename, String semanticHash) {
+    ScheduledFuture<?> existing = PENDING_ANALYSIS.remove(filename);
+    if (existing != null) {
+      existing.cancel(false);
+    }
+    ScheduledFuture<?> future = ANALYZE_EXECUTOR.schedule(
+      () -> {
+        try {
+          analyzeNow(filename, semanticHash);
+        } catch (Exception e) {
+          // Ignore background failures; on-demand requests will retry.
+        } finally {
+          PENDING_ANALYSIS.remove(filename);
+        }
+      },
+      ANALYZE_DEBOUNCE_MS,
+      TimeUnit.MILLISECONDS
+    );
+    PENDING_ANALYSIS.put(filename, future);
+  }
+
   private static Request parseRequest(String line) {
     Request req = new Request();
     req.file = extractJsonString(line, "file");
@@ -171,6 +256,19 @@ public class UmpleGoToDefJson {
     req.id = id.intValue();
     req.line = lineNum.intValue();
     req.col = colNum.intValue();
+    return req;
+  }
+
+  private static UpdateRequest parseUpdate(String line) {
+    UpdateRequest req = new UpdateRequest();
+    req.file = extractJsonString(line, "file");
+    Integer version = extractJsonInt(line, "version");
+    String textBase64 = extractJsonString(line, "textBase64");
+    if (req.file == null || textBase64 == null) {
+      return null;
+    }
+    req.version = version != null ? version.intValue() : 0;
+    req.text = decodeBase64(textBase64);
     return req;
   }
 
@@ -224,6 +322,11 @@ public class UmpleGoToDefJson {
       i += 1;
     }
     return out.toString();
+  }
+
+  private static String decodeBase64(String value) {
+    byte[] bytes = Base64.getDecoder().decode(value);
+    return new String(bytes, StandardCharsets.UTF_8);
   }
 
   private static String hashSemantic(String text) throws Exception {
