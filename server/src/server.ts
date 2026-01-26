@@ -238,27 +238,44 @@ connection.onDefinition(async (params) => {
     return [useLocation];
   }
 
-  // Fast path: try symbol index first
+  // Fast path: try symbol index first, filtered by reachable files
   if (symbolIndexReady) {
     const word = getWordAtPosition(document, params.position);
     if (word) {
-      const symbols = symbolIndex.findDefinition(word);
-      if (symbols.length > 0) {
-        // Found in symbol index - return immediately (fast path)
-        const results: Location[] = symbols.map((sym) => {
-          const uri = pathToFileURL(sym.file).toString();
-          return Location.create(
-            uri,
-            Range.create(
-              Position.create(sym.line, sym.column),
-              Position.create(sym.endLine, sym.endColumn),
-            ),
-          );
-        });
-        connection.console.info(
-          `Fast go-to-definition for "${word}": found ${results.length} result(s)`,
+      const allSymbols = symbolIndex.findDefinition(word);
+      if (allSymbols.length > 0) {
+        // Get the set of files reachable via use statements
+        const docPath = getDocumentFilePath(document);
+        const reachableFiles = docPath
+          ? collectReachableFiles(document.getText(), path.dirname(docPath))
+          : new Set<string>();
+
+        // Also include the current file
+        if (docPath) {
+          reachableFiles.add(path.normalize(docPath));
+        }
+
+        // Filter symbols to only those in reachable files
+        const filteredSymbols = allSymbols.filter((sym) =>
+          reachableFiles.has(path.normalize(sym.file)),
         );
-        return results;
+
+        if (filteredSymbols.length > 0) {
+          const results: Location[] = filteredSymbols.map((sym) => {
+            const uri = pathToFileURL(sym.file).toString();
+            return Location.create(
+              uri,
+              Range.create(
+                Position.create(sym.line, sym.column),
+                Position.create(sym.endLine, sym.endColumn),
+              ),
+            );
+          });
+          connection.console.info(
+            `Fast go-to-definition for "${word}": found ${results.length} result(s) (filtered from ${allSymbols.length})`,
+          );
+          return results;
+        }
       }
     }
   }
@@ -792,6 +809,62 @@ function extractUseStatements(content: string): string[] {
     }
   }
   return usePaths;
+}
+
+/**
+ * Collect all file paths reachable via transitive use statements.
+ * Used to filter go-to-definition results to only show symbols from imported files.
+ */
+function collectReachableFiles(
+  content: string,
+  documentDir: string,
+): Set<string> {
+  const visited = new Set<string>();
+  collectReachableFilesRecursive(content, documentDir, visited);
+  return visited;
+}
+
+/**
+ * Recursively collect reachable file paths.
+ */
+function collectReachableFilesRecursive(
+  content: string,
+  documentDir: string,
+  visited: Set<string>,
+): void {
+  const useStatements = extractUseStatements(content);
+
+  for (const usePath of useStatements) {
+    // Resolve the file path
+    let resolvedPath: string;
+    if (path.isAbsolute(usePath)) {
+      resolvedPath = usePath;
+    } else {
+      resolvedPath = path.resolve(documentDir, usePath);
+    }
+
+    // Ensure .ump extension
+    if (!resolvedPath.endsWith(".ump")) {
+      resolvedPath += ".ump";
+    }
+
+    const normalizedPath = path.normalize(resolvedPath);
+    if (visited.has(normalizedPath)) {
+      continue; // Already visited, skip to avoid cycles
+    }
+    visited.add(normalizedPath);
+
+    // Recursively process this file's use statements
+    if (fs.existsSync(resolvedPath)) {
+      try {
+        const fileContent = fs.readFileSync(resolvedPath, "utf8");
+        const fileDir = path.dirname(resolvedPath);
+        collectReachableFilesRecursive(fileContent, fileDir, visited);
+      } catch {
+        // Ignore read errors
+      }
+    }
+  }
 }
 
 /**
