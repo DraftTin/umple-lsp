@@ -702,12 +702,28 @@ function replaceUseWithStubs(
 
 /**
  * Generate external stub declarations for a use path.
- * Looks up symbols from the symbol index.
+ * Recursively resolves transitive use statements with cycle detection.
  */
 function generateStubsForUse(
   usePath: string,
   documentDir: string,
 ): string | null {
+  const allSymbols = collectTransitiveSymbols(usePath, documentDir, new Set());
+  if (allSymbols.length === 0) {
+    return null;
+  }
+  return generateStubDeclarations(allSymbols);
+}
+
+/**
+ * Recursively collect symbols from a use path and all its transitive dependencies.
+ * Uses a visited set for cycle detection.
+ */
+function collectTransitiveSymbols(
+  usePath: string,
+  documentDir: string,
+  visited: Set<string>,
+): SymbolEntry[] {
   // Resolve the file path
   let resolvedPath: string;
   if (path.isAbsolute(usePath)) {
@@ -721,22 +737,61 @@ function generateStubsForUse(
     resolvedPath += ".ump";
   }
 
-  // Look up symbols in the index
-  const symbols = symbolIndex.getFileSymbols(resolvedPath);
+  // Normalize path for cycle detection
+  const normalizedPath = path.normalize(resolvedPath);
+  if (visited.has(normalizedPath)) {
+    return []; // Already processed, avoid cycle
+  }
+  visited.add(normalizedPath);
+
+  // Get symbols from this file
+  let symbols = symbolIndex.getFileSymbols(resolvedPath);
   if (symbols.length === 0) {
     // File not indexed yet, try to index it now
     if (fs.existsSync(resolvedPath)) {
       symbolIndex.indexFile(resolvedPath);
-      const newSymbols = symbolIndex.getFileSymbols(resolvedPath);
-      if (newSymbols.length === 0) {
-        return null;
-      }
-      return generateStubDeclarations(newSymbols);
+      symbols = symbolIndex.getFileSymbols(resolvedPath);
     }
-    return null;
   }
 
-  return generateStubDeclarations(symbols);
+  const allSymbols: SymbolEntry[] = [...symbols];
+
+  // Parse the file to find its use statements and recursively resolve them
+  if (fs.existsSync(resolvedPath)) {
+    try {
+      const fileContent = fs.readFileSync(resolvedPath, "utf8");
+      const fileDir = path.dirname(resolvedPath);
+      const useStatements = extractUseStatements(fileContent);
+
+      for (const nestedUsePath of useStatements) {
+        const nestedSymbols = collectTransitiveSymbols(
+          nestedUsePath,
+          fileDir,
+          visited,
+        );
+        allSymbols.push(...nestedSymbols);
+      }
+    } catch {
+      // Ignore read errors
+    }
+  }
+
+  return allSymbols;
+}
+
+/**
+ * Extract use statement paths from file content.
+ */
+function extractUseStatements(content: string): string[] {
+  const usePaths: string[] = [];
+  const lines = content.split(/\r?\n/);
+  for (const line of lines) {
+    const match = line.match(/^\s*use\s+([^\s;]+)\s*;?/);
+    if (match) {
+      usePaths.push(match[1]);
+    }
+  }
+  return usePaths;
 }
 
 /**
