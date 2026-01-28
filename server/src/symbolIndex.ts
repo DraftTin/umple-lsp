@@ -361,7 +361,10 @@ export class SymbolIndex {
     // Use cached tree if available
     const fileIndex = this.files.get(filePath);
     let tree: Tree;
-    if (fileIndex?.tree && fileIndex.contentHash === this.hashContent(content)) {
+    if (
+      fileIndex?.tree &&
+      fileIndex.contentHash === this.hashContent(content)
+    ) {
       tree = fileIndex.tree;
     } else {
       tree = this.parser.parse(content);
