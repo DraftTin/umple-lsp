@@ -19,9 +19,19 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -b",
     "watch": "tsc -b -w",
-    "postinstall": "cd client && npm install && cd ../server && npm install && cd .."
+    "download-jar": "curl -# -L https://try.umple.org/scripts/umplesync.jar --output umplesync.jar"
   },
   "contributes": {
+    "configuration": {
+      "title": "Umple",
+      "properties": {
+        "umple.autoUpdate": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically update umplesync.jar to the latest version on startup."
+        }
+      }
+    },
     "languages": [
       {
         "id": "umple",
