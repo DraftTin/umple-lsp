@@ -1,0 +1,25 @@
+%YAML 1.2
+---
+name: Umple
+file_extensions: [ump]
+scope: source.umple
+
+contexts:
+  main:
+    - match: '\b(class|interface|trait|enum|association|namespace|use)\b'
+      scope: keyword.control.umple
+    - match: '\b(isA|singleton|immutable|abstract|lazy|const)\b'
+      scope: keyword.other.umple
+    - match: '\b(Integer|String|Boolean|Double|Float|Date|Time)\b'
+      scope: storage.type.umple
+    - match: '//.*$'
+      scope: comment.line.umple
+    - match: '/\*'
+      push: block_comment
+    - match: '"[^"]*"'
+      scope: string.quoted.double.umple
+
+  block_comment:
+    - meta_scope: comment.block.umple
+    - match: '\*/'
+      pop: true
