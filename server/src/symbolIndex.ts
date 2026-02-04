@@ -256,7 +256,6 @@ export class SymbolIndex {
       return false;
     }
 
-    // Get the node at the position
     const node = tree.rootNode.descendantForPosition({ row: line, column });
     if (!node) {
       return false;
@@ -304,15 +303,7 @@ export class SymbolIndex {
       if (node.type === "use_statement") {
         const pathNode = node.childForFieldName("path");
         if (pathNode) {
-          let pathText = pathNode.text;
-          // Remove quotes if present
-          if (
-            (pathText.startsWith('"') && pathText.endsWith('"')) ||
-            (pathText.startsWith("'") && pathText.endsWith("'"))
-          ) {
-            pathText = pathText.slice(1, -1);
-          }
-          usePaths.push(pathText);
+          usePaths.push(pathNode.text);
         }
       } else {
         for (let i = 0; i < node.childCount; i++) {
@@ -359,16 +350,8 @@ export class SymbolIndex {
       if (node.type === "use_statement") {
         const pathNode = node.childForFieldName("path");
         if (pathNode) {
-          let pathText = pathNode.text;
-          // Remove quotes if present
-          if (
-            (pathText.startsWith('"') && pathText.endsWith('"')) ||
-            (pathText.startsWith("'") && pathText.endsWith("'"))
-          ) {
-            pathText = pathText.slice(1, -1);
-          }
           useStatements.push({
-            path: pathText,
+            path: pathNode.text,
             line: node.startPosition.row,
           });
         }
@@ -414,7 +397,6 @@ export class SymbolIndex {
       tree = this.parser.parse(content);
     }
 
-    // Get the node at the position
     const node = tree.rootNode.descendantForPosition({ row: line, column });
     if (!node) {
       return null;
@@ -426,18 +408,70 @@ export class SymbolIndex {
       if (current.type === "use_statement") {
         const pathNode = current.childForFieldName("path");
         if (pathNode) {
-          let pathText = pathNode.text;
-          // Remove quotes if present
-          if (
-            (pathText.startsWith('"') && pathText.endsWith('"')) ||
-            (pathText.startsWith("'") && pathText.endsWith("'"))
-          ) {
-            pathText = pathText.slice(1, -1);
-          }
-          return pathText;
+          return pathNode.text;
         }
         return null;
       }
+      current = current.parent;
+    }
+
+    return null;
+  }
+
+  /**
+   * Get the use path prefix for completion at a specific position.
+   * Uses tree-sitter to detect use_statement context, with fallback for
+   * ERROR nodes (e.g. `use ` or `use "St` which don't parse as valid use_statement).
+   * @returns The prefix string (possibly empty) if in use context, or null if not
+   */
+  getUseCompletionPrefix(
+    filePath: string,
+    content: string,
+    line: number,
+    column: number,
+  ): string | null {
+    if (!this.initialized || !this.parser) {
+      return null;
+    }
+
+    const fileIndex = this.files.get(filePath);
+    let tree: Tree;
+    if (
+      fileIndex?.tree &&
+      fileIndex.contentHash === this.hashContent(content)
+    ) {
+      tree = fileIndex.tree;
+    } else {
+      tree = this.parser.parse(content);
+    }
+
+    // Use column - 1 to find the node at the last typed character,
+    // since the cursor is positioned after the last character
+    const node = tree.rootNode.descendantForPosition({ row: line, column });
+    if (!node) {
+      return null;
+    }
+
+    // Walk up the tree looking for use_statement or ERROR
+    let current: SyntaxNode | null = node;
+    while (current) {
+      if (current.type === "use_statement") {
+        const pathNode = current.childForFieldName("path");
+        if (pathNode) {
+          return pathNode.text;
+        }
+        return "";
+      }
+
+      if (current.type === "ERROR") {
+        // Check if the ERROR node text looks like a partial use statement
+        const errorText = current.text;
+        const match = errorText.match(/^use\s+([a-zA-Z0-9_./]*)$/);
+        if (match) {
+          return match[1];
+        }
+      }
+
       current = current.parent;
     }
 

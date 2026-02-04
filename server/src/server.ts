@@ -275,6 +275,25 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
     return KEYWORD_COMPLETIONS;
   }
 
+  // Check for use statement file completion
+  const docPath = getDocumentFilePath(document);
+  if (docPath && symbolIndexReady) {
+    const usePrefix = symbolIndex.getUseCompletionPrefix(
+      docPath,
+      document.getText(),
+      params.position.line,
+      Math.max(0, params.position.character - 1),
+    );
+    if (usePrefix !== null) {
+      return getUseFileCompletions(
+        document,
+        usePrefix,
+        params.position.line,
+        params.position.character,
+      );
+    }
+  }
+
   const context = detectContext(
     document,
     params.position.line,
@@ -290,11 +309,9 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
     prefix,
   );
   const modelItems = await getModelCompletions(document);
-  // const classItems = getClassNameCompletions(prefix);
   return dedupeCompletions([
     ...keywordItems,
     ...filterCompletions(modelItems, prefix),
-    // ...classItems,
   ]);
 });
 
@@ -319,7 +336,7 @@ connection.onDefinition(async (params) => {
         docPath,
         document.getText(),
         params.position.line,
-        params.position.character,
+        Math.max(0, params.position.character - 1),
       )
     ) {
       return [];
@@ -1200,7 +1217,7 @@ function resolveUseDefinitionFromLine(
     docPath,
     document.getText(),
     position.line,
-    position.character,
+    Math.max(0, position.character - 1),
   );
 
   if (!usePath) {
@@ -1466,6 +1483,45 @@ function getClassNameCompletions(prefix: string): CompletionItem[] {
   }));
 
   return filterCompletions(items, prefix);
+}
+
+function getUseFileCompletions(
+  document: TextDocument,
+  prefix: string,
+  line: number,
+  character: number,
+): CompletionItem[] {
+  const docDir = getDocumentDirectory(document);
+  if (!docDir) {
+    return [];
+  }
+
+  const docBasename = path.basename(getDocumentFilePath(document) ?? "");
+
+  let files: string[];
+  try {
+    files = fs
+      .readdirSync(docDir)
+      .filter((f) => f.endsWith(".ump") && f !== docBasename);
+  } catch {
+    return [];
+  }
+
+  // Replace range covers the entire prefix the user has typed
+  const replaceRange = Range.create(
+    Position.create(line, character - prefix.length),
+    Position.create(line, character),
+  );
+
+  const lowerPrefix = prefix.toLowerCase();
+  return files
+    .filter((f) => f.toLowerCase().startsWith(lowerPrefix))
+    .map((f) => ({
+      label: f,
+      kind: CompletionItemKind.File,
+      detail: "Umple file",
+      textEdit: { range: replaceRange, newText: f },
+    }));
 }
 
 async function getModelCompletions(
