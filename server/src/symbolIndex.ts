@@ -26,6 +26,24 @@ export type SymbolKind =
   | "method"
   | "association";
 
+const DUMMY_IDENTIFIER = "__CURSOR__";
+
+export type CompletionContext =
+  | "top"
+  | "class_body"
+  | "state_machine"
+  | "state"
+  | "association"
+  | "enum"
+  | "method"
+  | "use_path"
+  | "isa_type"
+  | "transition_target"
+  | "association_type"
+  | "depend_package"
+  | "comment"
+  | "unknown";
+
 export interface SymbolEntry {
   name: string;
   kind: SymbolKind;
@@ -419,68 +437,217 @@ export class SymbolIndex {
   }
 
   /**
-   * Get the use path prefix for completion at a specific position.
-   * Uses tree-sitter to detect use_statement context, with fallback for
-   * ERROR nodes (e.g. `use ` or `use "St` which don't parse as valid use_statement).
-   * @returns The prefix string (possibly empty) if in use context, or null if not
+   * Get the completion context at a specific position using the dummy identifier trick.
+   *
+   * Inserts a dummy identifier (__CURSOR__) at the cursor position, parses the
+   * modified text, then walks up from the dummy node to determine context.
+   * This produces reliable results because the dummy forces the parser to place
+   * it in a grammatically valid position (e.g. "isA __CURSOR__" parses as an
+   * isa_declaration with type __CURSOR__).
+   *
+   * @param filePath Path to the file
+   * @param content File content (original, without dummy)
+   * @param line 0-indexed line number
+   * @param column 0-indexed column number (raw cursor position, NOT column-1)
+   * @returns The completion context type
    */
-  getUseCompletionPrefix(
+  getCompletionContext(
     filePath: string,
     content: string,
     line: number,
     column: number,
-  ): string | null {
+  ): CompletionContext {
     if (!this.initialized || !this.parser) {
-      return null;
+      return "unknown";
     }
 
-    const fileIndex = this.files.get(filePath);
-    let tree: Tree;
-    if (
-      fileIndex?.tree &&
-      fileIndex.contentHash === this.hashContent(content)
-    ) {
-      tree = fileIndex.tree;
-    } else {
-      tree = this.parser.parse(content);
+    // Insert dummy identifier at cursor position
+    const lines = content.split("\n");
+    if (line < 0 || line >= lines.length) {
+      return "unknown";
+    }
+    const lineText = lines[line];
+    lines[line] =
+      lineText.substring(0, column) +
+      DUMMY_IDENTIFIER +
+      lineText.substring(column);
+    const modifiedText = lines.join("\n");
+
+    // Parse modified text (throwaway — do NOT update index)
+    const tree = this.parser.parse(modifiedText);
+
+    // Find the dummy node — it starts at (line, column) in the modified text
+    const dummyNode = tree.rootNode.descendantForPosition({
+      row: line,
+      column,
+    });
+    if (!dummyNode) {
+      return "unknown";
     }
 
-    // Use column - 1 to find the node at the last typed character,
-    // since the cursor is positioned after the last character
-    const node = tree.rootNode.descendantForPosition({ row: line, column });
-    if (!node) {
-      return null;
-    }
-
-    // Walk up the tree looking for use_statement or ERROR
-    let current: SyntaxNode | null = node;
+    // Walk up from the dummy node to determine context
+    let current: SyntaxNode | null = dummyNode;
     while (current) {
-      if (current.type === "use_statement") {
-        const pathNode = current.childForFieldName("path");
-        if (pathNode) {
-          return pathNode.text;
-        }
-        return "";
-      }
+      switch (current.type) {
+        // Comments: suppress all completions
+        case "line_comment":
+        case "block_comment":
+          return "comment";
 
-      if (current.type === "ERROR") {
-        // Check if the ERROR node text looks like a partial use statement
-        const errorText = current.text;
-        const match = errorText.match(/^use\s+([a-zA-Z0-9_./]*)$/);
-        if (match) {
-          return match[1];
-        }
-      }
+        // Specific keyword contexts (checked before structural)
+        case "use_statement":
+          return "use_path";
 
+        case "isa_declaration":
+          return "isa_type";
+
+        case "transition": {
+          const targetNode = current.childForFieldName("target");
+          if (targetNode && targetNode.text.includes(DUMMY_IDENTIFIER)) {
+            return "transition_target";
+          }
+          // Dummy is in event position — fall through to state context
+          return "state";
+        }
+
+        case "depend_statement":
+          return "depend_package";
+
+        case "association_inline": {
+          const rightType = current.childForFieldName("right_type");
+          if (rightType && rightType.text.includes(DUMMY_IDENTIFIER)) {
+            return "association_type";
+          }
+          // Dummy is in role or other position — fall through
+          break;
+        }
+
+        case "association_member": {
+          const leftType = current.childForFieldName("left_type");
+          const rightType = current.childForFieldName("right_type");
+          if (
+            (leftType && leftType.text.includes(DUMMY_IDENTIFIER)) ||
+            (rightType && rightType.text.includes(DUMMY_IDENTIFIER))
+          ) {
+            return "association_type";
+          }
+          return "association";
+        }
+
+        // Brace-delimited: always reliable
+        case "state":
+          return "state";
+        case "state_machine":
+          return "state_machine";
+        case "association_definition":
+          return "association";
+        case "enum_definition":
+          return "enum";
+        case "class_definition":
+        case "trait_definition":
+        case "interface_definition":
+          return "class_body";
+        case "source_file":
+          return "top";
+        case "code_content":
+        case "code_block":
+          return "method";
+      }
       current = current.parent;
     }
 
-    return null;
+    return "unknown";
+  }
+
+  /**
+   * Get all symbols of a specific kind from the index.
+   * @param kind The kind of symbols to retrieve
+   * @returns Array of symbol entries of that kind
+   */
+  getSymbolsByKind(kind: SymbolKind): SymbolEntry[] {
+    const result: SymbolEntry[] = [];
+    for (const symbols of this.symbolsByName.values()) {
+      for (const symbol of symbols) {
+        if (symbol.kind === kind) {
+          result.push(symbol);
+        }
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Get all symbols (useful for type completions).
+   */
+  getAllSymbols(): SymbolEntry[] {
+    const result: SymbolEntry[] = [];
+    for (const symbols of this.symbolsByName.values()) {
+      result.push(...symbols);
+    }
+    return result;
   }
 
   // =====================
   // Private methods
   // =====================
+
+  /**
+   * Debug helper: print a tree-sitter AST as an S-expression with positions.
+   * Output matches the format used by `tree-sitter parse` and Neovim InspectTree.
+   */
+  debugPrintTree(content: string): string | null {
+    if (!this.initialized || !this.parser) {
+      return null;
+    }
+    const tree = this.parser.parse(content);
+    const lines: string[] = [];
+    const visit = (node: SyntaxNode, depth: number) => {
+      const indent = "  ".repeat(depth);
+      const field = node.parent ? this.getFieldName(node.parent, node) : null;
+      const prefix = field ? `${field}: ` : "";
+      const pos = `[${node.startPosition.row}, ${node.startPosition.column}] - [${node.endPosition.row}, ${node.endPosition.column}]`;
+      if (node.childCount === 0) {
+        lines.push(`${indent}${prefix}(${node.type} ${pos}) "${node.text}"`);
+      } else {
+        lines.push(`${indent}${prefix}(${node.type} ${pos}`);
+        for (let i = 0; i < node.childCount; i++) {
+          const child = node.child(i);
+          if (child) visit(child, depth + 1);
+        }
+        lines.push(`${indent})`);
+      }
+    };
+    visit(tree.rootNode, 0);
+    return lines.join("\n");
+  }
+
+  /**
+   * Get the field name for a child node within its parent.
+   */
+  private getFieldName(parent: SyntaxNode, child: SyntaxNode): string | null {
+    // Check common field names used in the Umple grammar
+    const fieldNames = [
+      "name",
+      "path",
+      "type",
+      "return_type",
+      "left_role",
+      "right_role",
+      "right_type",
+      "left_type",
+      "event",
+      "target",
+      "package",
+      "language",
+    ];
+    for (const name of fieldNames) {
+      const fieldNode = parent.childForFieldName(name);
+      if (fieldNode && fieldNode.id === child.id) {
+        return name;
+      }
+    }
+    return null;
+  }
 
   private readFileSafe(filePath: string): string | null {
     try {
