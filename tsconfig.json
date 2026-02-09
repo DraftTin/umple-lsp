@@ -16,9 +16,6 @@
 	"references": [
 		{
 			"path": "./packages/server"
-		},
-		{
-			"path": "./packages/vscode"
 		}
 	]
 }
